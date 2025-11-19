@@ -1,0 +1,83 @@
+library(readxl)
+library(dplyr)
+library(zoo)
+library(midasr)
+
+# Example indicator list (customize for your use)
+indicators <- c("indicator1", "indicator2", "indicator3")
+
+# Monthly data (placeholder path — data not provided)
+monthly_raw <- read_excel(
+  "data/example_inputs.xlsx",
+  sheet = "Country_M",
+  range = "B2:L",
+  col_names = c("Date", indicators),
+  col_types = c("date", rep("numeric", length(indicators)))
+)
+
+monthly <- monthly_raw %>%
+  mutate(ym = as.yearmon(Date)) %>%
+  select(ym, all_of(indicators)) %>%
+  filter(!is.na(ym))
+
+# Example differencing
+dl_zoo <- monthly %>%
+  arrange(ym) %>%
+  mutate(across(indicators, ~ c(NA, diff(log(.x))), .names = "dl_{.col}")) %>%
+  slice(-1) %>%
+  { zoo(select(., starts_with("dl_")), order.by = .$ym) }
+
+# Quarterly data
+quarterly_raw <- read_excel(
+  "data/example_inputs.xlsx",
+  sheet = "Country_Q",
+  range = "B2:D",
+  col_names = c("Date", "gdp", "demand"),
+  col_types = c("date", "numeric", "numeric")
+)
+
+quarterly <- quarterly_raw %>%
+  mutate(qtr = as.yearqtr(Date), y = c(NA, diff(log(gdp)))) %>%
+  filter(!is.na(y)) %>%
+  select(qtr, y)
+
+y_zoo <- zoo(quarterly$y, order.by = quarterly$qtr)
+
+# Shock dummy example
+shock_dates <- as.yearqtr(c("2008 Q4", "2020 Q2"))
+dumgfc <- zoo(0, order.by = quarterly$qtr)
+dumgfc[shock_dates] <- 1
+
+# Model parameters
+maxlag <- 9
+train_start <- as.yearqtr("2022 Q1")
+train_end <- as.yearqtr("2025 Q1")
+
+start_mon <- as.yearmon(train_start)
+end_mon <- as.yearmon(train_end)
+
+y_train <- window(y_zoo, start = train_start, end = train_end)
+dum_train <- window(dumgfc, start = train_start, end = train_end)
+dl_train <- window(dl_zoo, start = start_mon, end = end_mon + 2/12)
+
+# Convert to ts
+x_ts <- ts(coredata(dl_train[, 1]), start = c(2022, 1), frequency = 12)
+y_ts <- ts(coredata(y_train), start = c(2022, 1), frequency = 4)
+dum_ts <- ts(coredata(dum_train), start = start(y_ts), frequency = 4)
+
+# Fit MIDAS model
+fit <- midas_r(
+  y_ts ~ dum_ts + stats::lag(y_ts, 1) + mls(x_ts, 0:9, m = 3, fun = almonp),
+  start = list(x_ts = rep(0.1, 3))
+)
+
+summary(fit)
+
+# Plot results
+yf_vec <- as.numeric(fitted(fit))
+y_tail <- tail(y_ts, length(yf_vec))
+yh_ts <- ts(yf_vec, start = start(y_tail), frequency = 4)
+
+ts.plot(y_tail, main = "MIDAS: Actual vs Fitted", ylab = "GDP growth")
+lines(yh_ts, col = "red", lty = 2, lwd = 2)
+legend("topleft", c("Actual", "Fitted"), col = c("black", "red"), lty = c(1, 2), bty = "n")
